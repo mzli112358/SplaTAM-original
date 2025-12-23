@@ -60,6 +60,27 @@ if __name__ == "__main__":
     run_name = config['run_name']
     params_path = os.path.join(work_path, run_name, "params.npz")
 
+    # Try to load params.npz, if not found, try to load latest checkpoint
+    if not os.path.exists(params_path):
+        print(f"params.npz not found, looking for latest checkpoint...")
+        result_dir = os.path.join(work_path, run_name)
+        max_checkpoint = -1
+        if os.path.exists(result_dir):
+            for filename in os.listdir(result_dir):
+                if filename.startswith("params") and filename.endswith(".npz") and filename != "params.npz":
+                    try:
+                        checkpoint_num = int(filename[6:-4])  # Extract number from "params{num}.npz"
+                        if checkpoint_num > max_checkpoint:
+                            max_checkpoint = checkpoint_num
+                    except ValueError:
+                        continue
+        
+        if max_checkpoint >= 0:
+            params_path = os.path.join(result_dir, f"params{max_checkpoint}.npz")
+            print(f"Using checkpoint: {params_path}")
+        else:
+            raise FileNotFoundError(f"Neither params.npz nor any checkpoint found in {result_dir}")
+
     params = dict(np.load(params_path, allow_pickle=True))
     means = params['means3D']
     scales = params['log_scales']

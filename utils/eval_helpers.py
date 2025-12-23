@@ -4,6 +4,9 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 import numpy as np
+# Set matplotlib backend to non-interactive for headless environments
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 
 from datasets.gradslam_datasets.geometryutils import relative_transformation
@@ -110,10 +113,13 @@ def plot_rgbd_silhouette(color, depth, rastered_color, rastered_depth, presence_
                          psnr, depth_l1, fig_title, plot_dir=None, plot_name=None, 
                          save_plot=False, wandb_run=None, wandb_step=None, wandb_title=None, diff_rgb=None):
     # Determine Plot Aspect Ratio
-    aspect_ratio = color.shape[2] / color.shape[1]
+    aspect_ratio = color.shape[2] / color.shape[1] if color.shape[1] > 0 else 1.0
     fig_height = 8
     fig_width = 14/1.55
     fig_width = fig_width * aspect_ratio
+    # Ensure minimum size
+    fig_width = max(fig_width, 1.0)
+    fig_height = max(fig_height, 1.0)
     # Plot the Ground Truth and Rasterized RGB & Depth, along with Diff Depth & Silhouette
     fig, axs = plt.subplots(2, 3, figsize=(fig_width, fig_height))
     axs[0, 0].imshow(color.cpu().permute(1, 2, 0))

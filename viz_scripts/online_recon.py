@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sys
 import time
 from importlib.machinery import SourceFileLoader
@@ -27,15 +28,76 @@ from utils.slam_external import build_rotation
 def load_camera(cfg, scene_path):
     all_params = dict(np.load(scene_path, allow_pickle=True))
     params = all_params
-    org_width = params['org_width']
-    org_height = params['org_height']
-    w2c = params['w2c']
-    intrinsics = params['intrinsics']
-    k = intrinsics[:3, :3]
-
-    # Scale intrinsics to match the visualization resolution
-    k[0, :] *= cfg['viz_w'] / org_width
-    k[1, :] *= cfg['viz_h'] / org_height
+    
+    # Check if camera parameters exist in the file
+    if 'org_width' in params and 'org_height' in params and 'w2c' in params and 'intrinsics' in params:
+        # Use existing camera parameters
+        org_width = params['org_width']
+        org_height = params['org_height']
+        w2c = params['w2c']
+        intrinsics = params['intrinsics']
+        k = intrinsics[:3, :3]
+        
+        # Scale intrinsics to match the visualization resolution
+        k[0, :] *= cfg['viz_w'] / org_width
+        k[1, :] *= cfg['viz_h'] / org_height
+    else:
+        # Camera parameters not in file, compute from cam_unnorm_rots and cam_trans
+        print("Warning: Camera parameters not found in .npz file, using defaults and computing from camera poses...")
+        
+        # Default values for Replica dataset
+        org_width = 1200
+        org_height = 680
+        # Default intrinsics for Replica (fx, fy typically ~600 for 1200x680 resolution)
+        fx = fy = 600.0
+        cx = org_width / 2.0
+        cy = org_height / 2.0
+        
+        # Compute first frame w2c from cam_unnorm_rots and cam_trans
+        if 'cam_unnorm_rots' in params and 'cam_trans' in params:
+            cam_rots = torch.tensor(params['cam_unnorm_rots']).cuda().float()
+            cam_trans = torch.tensor(params['cam_trans']).cuda().float()
+            
+            # Handle different shapes: (1, 4, T) or (4, T) or (4,)
+            if len(cam_rots.shape) == 3:
+                # Shape: (batch, 4, timesteps) - get first batch and first timestep
+                cam_rot_1d = cam_rots[0, :, 0]  # Shape: (4,)
+                cam_tran = cam_trans[0, :, 0]
+            elif len(cam_rots.shape) == 2:
+                # Shape: (4, timesteps) - get first timestep
+                cam_rot_1d = cam_rots[:, 0]  # Shape: (4,)
+                cam_tran = cam_trans[:, 0]
+            else:
+                # Shape: (4,) - single rotation
+                cam_rot_1d = cam_rots  # Shape: (4,)
+                cam_tran = cam_trans
+            
+            # Normalize and convert to 2D for build_rotation (expects (N, 4))
+            cam_rot_1d = F.normalize(cam_rot_1d, dim=0)
+            cam_rot_2d = cam_rot_1d.unsqueeze(0)  # Shape: (1, 4)
+            
+            # build_rotation expects (N, 4) and returns (N, 3, 3)
+            rot_matrix = build_rotation(cam_rot_2d)  # Shape: (1, 3, 3)
+            rot_matrix = rot_matrix[0]  # Shape: (3, 3)
+            
+            w2c = torch.eye(4).cuda().float()
+            w2c[:3, :3] = rot_matrix
+            w2c[:3, 3] = cam_tran
+            w2c = w2c.cpu().numpy()
+        else:
+            # Use identity matrix as fallback
+            print("Warning: cam_unnorm_rots and cam_trans not found, using identity camera pose")
+            w2c = np.eye(4)
+        
+        # Create intrinsics matrix
+        k = np.array([[fx, 0, cx],
+                      [0, fy, cy],
+                      [0, 0, 1]], dtype=np.float32)
+        
+        # Scale intrinsics to match the visualization resolution
+        k[0, :] *= cfg['viz_w'] / org_width
+        k[1, :] *= cfg['viz_h'] / org_height
+    
     return w2c, k
 
 
@@ -48,10 +110,30 @@ def load_scene_data(scene_path):
     all_w2cs = []
     num_t = params['cam_unnorm_rots'].shape[-1]
     for t_i in range(num_t):
-        cam_rot = F.normalize(params['cam_unnorm_rots'][..., t_i])
-        cam_tran = params['cam_trans'][..., t_i]
+        cam_rot_raw = params['cam_unnorm_rots'][..., t_i]  # Could be (4,) or (1, 4) or (batch, 4)
+        cam_tran_raw = params['cam_trans'][..., t_i]  # Could be (3,) or (1, 3) or (batch, 3)
+        
+        # Ensure cam_rot is 1D, then normalize
+        if len(cam_rot_raw.shape) > 1:
+            cam_rot_1d = cam_rot_raw.flatten()[:4]  # Take first 4 elements
+        else:
+            cam_rot_1d = cam_rot_raw
+        
+        # Ensure cam_tran is 1D
+        if len(cam_tran_raw.shape) > 1:
+            cam_tran = cam_tran_raw.flatten()[:3]  # Take first 3 elements
+        else:
+            cam_tran = cam_tran_raw
+        
+        cam_rot_1d = F.normalize(cam_rot_1d, dim=0)
+        cam_rot_2d = cam_rot_1d.unsqueeze(0)  # Shape: (1, 4) for build_rotation
+        
+        # build_rotation expects (N, 4) and returns (N, 3, 3)
+        rot_matrix = build_rotation(cam_rot_2d)  # Shape: (1, 3, 3)
+        rot_matrix = rot_matrix[0]  # Shape: (3, 3)
+        
         rel_w2c = torch.eye(4).cuda().float()
-        rel_w2c[:3, :3] = build_rotation(cam_rot)
+        rel_w2c[:3, :3] = rot_matrix
         rel_w2c[:3, 3] = cam_tran
         all_w2cs.append(rel_w2c.cpu().numpy())
     
@@ -70,12 +152,18 @@ def load_scene_data(scene_path):
 
 
 def get_rendervars(params, w2c, curr_timestep):
-    params_timesteps = params['timestep']
-    selected_params_idx = params_timesteps <= curr_timestep
+    # Check if timestep field exists for filtering Gaussians
+    if 'timestep' in params:
+        params_timesteps = params['timestep']
+        selected_params_idx = params_timesteps <= curr_timestep
+    else:
+        # If no timestep field, show all Gaussians
+        selected_params_idx = torch.ones(params['means3D'].shape[0], dtype=torch.bool, device='cuda')
+    
     keys = [k for k in params.keys() if
             k not in ['org_width', 'org_height', 'w2c', 'intrinsics', 
                       'gt_w2c_all_frames', 'cam_unnorm_rots',
-                      'cam_trans', 'keyframe_time_indices']]
+                      'cam_trans', 'keyframe_time_indices', 'timestep']]
     selected_params = deepcopy(params)
     for k in keys:
         selected_params[k] = selected_params[k][selected_params_idx]
@@ -339,26 +427,72 @@ def visualize(scene_path, cfg):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("experiment", type=str, help="Path to experiment file")
+    parser = argparse.ArgumentParser(description="Visualize online 3D Gaussian Splatting reconstruction")
+    parser.add_argument("input", type=str, help="Path to experiment file (.py) or .npz file")
 
     args = parser.parse_args()
 
-    experiment = SourceFileLoader(
-        os.path.basename(args.experiment), args.experiment
-    ).load_module()
-
-    seed_everything(seed=experiment.config["seed"])
-
-    if "scene_path" not in experiment.config:
-        results_dir = os.path.join(
-            experiment.config["workdir"], experiment.config["run_name"]
+    # Check if input is a .npz file (direct file specification)
+    if args.input.endswith('.npz') and os.path.isfile(args.input):
+        scene_path = os.path.abspath(args.input)
+        print(f"Using specified .npz file: {scene_path}")
+        
+        # Use default visualization configuration
+        viz_cfg = dict(
+            render_mode='color',  # ['color', 'depth' or 'centers']
+            offset_first_viz_cam=True,  # Offsets the view camera back by 0.5 units along the view direction
+            show_sil=False,  # Show Silhouette instead of RGB
+            visualize_cams=True,  # Visualize Camera Frustums and Trajectory
+            viz_w=600, viz_h=340,
+            viz_near=0.01, viz_far=100.0,
+            view_scale=2,
+            viz_fps=5,
+            enter_interactive_post_online=True,  # Enter Interactive Mode after Online Recon Viz
         )
-        scene_path = os.path.join(results_dir, "params.npz")
+        
+        seed_everything(seed=42)  # Use default seed when loading file directly
     else:
-        scene_path = experiment.config["scene_path"]
-    viz_cfg = experiment.config["viz"]
+        # Original logic: load experiment configuration file
+        experiment = SourceFileLoader(
+            os.path.basename(args.input), args.input
+        ).load_module()
 
-    # Visualize Final Reconstruction
+        seed_everything(seed=experiment.config["seed"])
+
+        if "scene_path" not in experiment.config:
+            results_dir = os.path.join(
+                experiment.config["workdir"], experiment.config["run_name"]
+            )
+            
+            # Check if params.npz exists (final result)
+            params_npz_path = os.path.join(results_dir, "params.npz")
+            
+            if os.path.exists(params_npz_path):
+                scene_path = params_npz_path
+                print(f"Found final params file: {scene_path}")
+            else:
+                # Find the latest checkpoint file (params{数字}.npz)
+                pattern = re.compile(r'^params(\d+)\.npz$')
+                checkpoint_files = []
+                
+                if os.path.exists(results_dir):
+                    for filename in os.listdir(results_dir):
+                        match = pattern.match(filename)
+                        if match:
+                            checkpoint_num = int(match.group(1))
+                            checkpoint_files.append((checkpoint_num, filename))
+                
+                if checkpoint_files:
+                    # Sort by checkpoint number and get the latest
+                    checkpoint_files.sort(key=lambda x: x[0], reverse=True)
+                    latest_checkpoint = checkpoint_files[0]
+                    scene_path = os.path.join(results_dir, latest_checkpoint[1])
+                    print(f"Found latest checkpoint file: {scene_path} (frame {latest_checkpoint[0]})")
+                else:
+                    raise FileNotFoundError(f"No params file found in {results_dir}. Please check if the experiment has been run.")
+        else:
+            scene_path = experiment.config["scene_path"]
+        viz_cfg = experiment.config["viz"]
+
+    # Visualize Online Reconstruction
     visualize(scene_path, viz_cfg)

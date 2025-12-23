@@ -1,0 +1,35 @@
+# 1. 激活 conda 环境
+conda activate isogs
+# 2. 进入项目目录
+cd /media/pw_is_6/Disk2/IsoGS-SLAM/SplaTAM-original
+# 3. 运行 SLAM（Replica 数据集）
+python scripts/splatam.py configs/replica/splatam.py
+
+
+
+
+# 1. 激活 conda 环境
+conda activate isogs
+# 2. 进入项目目录
+cd /media/pw_is_6/Disk2/IsoGS-SLAM/SplaTAM-original
+# 3. 导出 PLY 文件
+python scripts/export_ply.py configs/replica/splatam.py
+
+
+
+
+  
+# 不需要太细的体素，靠“增厚”来补洞
+# 使用 0.01 的精度，iso-level 可以稍微回调一些
+python scripts/extract_mesh_fast.py configs/replica/splatam.py \
+    --voxel-size 0.01 \
+    --iso-level 0.3 \
+    --no-cleaning
+    
+    
+    
+     \
+    --output mesh_thickened_1350.ply
+
+
+

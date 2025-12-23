@@ -1,13 +1,18 @@
 import os
 from os.path import join as p_join
 
-scenes = ["room_0", "room_1", "room_2",
-          "office_0", "office_1", "office_2",
-          "office_3", "office_4"]
+scenes = ["room0", "room1", "room2",
+          "office0", "office1", "office2",
+          "office3", "office4"]
 
 primary_device="cuda:0"
 seed = 0
-scene_name = scenes[0]
+
+# 支持通过环境变量 SCENE 来选择场景（0-7），如果没有设置则默认使用第一个场景
+scene_idx = int(os.environ.get("SCENE", "0"))
+if scene_idx < 0 or scene_idx >= len(scenes):
+    raise ValueError(f"场景索引 {scene_idx} 超出范围 [0, {len(scenes)-1}]")
+scene_name = scenes[scene_idx]
 
 # # SLAM
 # use_train_split = True
@@ -21,10 +26,11 @@ mapping_window_size = 24
 tracking_iters = 40
 mapping_iters = 60
 
-group_name = "Replica_V2"
+group_name = "Replica"
 run_name = f"{scene_name}_{seed}"
 
 config = dict(
+    scene_path=p_join(f"./experiments/{group_name}", run_name, 'params.npz'),
     workdir=f"./experiments/{group_name}",
     run_name=run_name,
     seed=seed,
@@ -42,7 +48,7 @@ config = dict(
     checkpoint_time_idx=0,
     save_checkpoints=False, # Save Checkpoints
     checkpoint_interval=100, # Checkpoint Interval
-    use_wandb=True,
+    use_wandb=False,
     wandb=dict(
         entity="theairlab",
         project="SplaTAM",
@@ -52,8 +58,8 @@ config = dict(
         eval_save_qual=True,
     ),
     data=dict(
-        basedir="./data/Replica_V2",
-        gradslam_data_cfg="./configs/data/replica_v2.yaml",
+        basedir="./data/Replica",
+        gradslam_data_cfg="./configs/data/replica.yaml",
         sequence=scene_name,
         use_train_split=use_train_split,
         desired_image_height=680,
@@ -147,3 +153,4 @@ config = dict(
         enter_interactive_post_online=True, # Enter Interactive Mode after Online Recon Viz
     ),
 )
+

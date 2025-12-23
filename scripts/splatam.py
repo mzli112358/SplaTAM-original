@@ -1,4 +1,6 @@
 import argparse
+import csv
+import json
 import os
 import shutil
 import sys
@@ -14,6 +16,9 @@ for p in sys.path:
     print(p)
 
 import cv2
+# Set matplotlib backend to non-interactive for headless environments
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -24,7 +29,7 @@ import wandb
 from datasets.gradslam_datasets import (load_dataset_config, ICLDataset, ReplicaDataset, ReplicaV2Dataset, AzureKinectDataset,
                                         ScannetDataset, Ai2thorDataset, Record3DDataset, RealsenseDataset, TUMDataset,
                                         ScannetPPDataset, NeRFCaptureDataset)
-from utils.common_utils import seed_everything, save_params_ckpt, save_params
+from utils.common_utils import seed_everything, save_params_ckpt
 from utils.eval_helpers import report_loss, report_progress, eval
 from utils.keyframe_selection import keyframe_selection_overlap
 from utils.recon_helpers import setup_camera
@@ -35,6 +40,137 @@ from utils.slam_helpers import (
 from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
 
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
+
+
+# ==================== Metrics CSV Logging Functions ====================
+
+def _to_float(val, default=0.0):
+    """Convert value to float, handling None and torch.Tensor."""
+    if val is None:
+        return default
+    if hasattr(val, "item"):
+        return float(val.item())
+    return float(val)
+
+
+def _init_metrics_csv(csv_path, checkpoint_time_idx=None):
+    """
+    Initialize metrics CSV file.
+    
+    If file exists and checkpoint_time_idx is provided, truncate rows with frame >= checkpoint_time_idx.
+    """
+    fieldnames = [
+        "frame",          # 当前全局帧号 time_idx
+        "stage",          # 'tracking' 或 'mapping'
+        "step",           # 对应的迭代 step
+        "loss",           # 总损失
+        "image_loss",     # RGB损失
+        "depth_loss",     # 深度损失
+        "flat_loss",      # 扁平化损失（当前项目没有，设为0.0）
+        "iso_loss",       # 等势面损失（当前项目没有，设为0.0）
+        "mean_density",   # 平均密度值（当前项目没有，设为0.0）
+    ]
+    
+    if os.path.exists(csv_path):
+        # File exists: read and truncate if needed
+        if checkpoint_time_idx is not None and checkpoint_time_idx > 0:
+            # Read existing rows
+            keep_rows = []
+            try:
+                with open(csv_path, "r", newline="") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        frame_val = int(row.get("frame", -1))
+                        # Only keep rows before checkpoint
+                        if frame_val >= 0 and frame_val < checkpoint_time_idx:
+                            keep_rows.append(row)
+            except Exception:
+                keep_rows = []
+            
+            # Rewrite file with header and kept rows
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(keep_rows)
+        # If no checkpoint or checkpoint_time_idx is 0, just keep existing file
+    else:
+        # File doesn't exist: create new file with header
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+    
+    return fieldnames
+
+
+def _append_metrics_row(csv_path, fieldnames, frame_idx, stage, step_idx, losses):
+    """
+    Append a row to metrics CSV.
+    
+    Args:
+        csv_path: Path to CSV file
+        fieldnames: List of field names
+        frame_idx: Frame index (time_idx)
+        stage: 'tracking' or 'mapping'
+        step_idx: Iteration step index
+        losses: Dictionary of losses (may contain 'loss', 'im', 'depth', etc.)
+    """
+    try:
+        row = {
+            "frame": int(frame_idx),
+            "stage": str(stage),
+            "step": int(step_idx),
+            "loss": _to_float(losses.get("loss")),
+            "image_loss": _to_float(losses.get("im")),
+            "depth_loss": _to_float(losses.get("depth")),
+            "flat_loss": 0.0,  # 当前项目没有，设为0.0
+            "iso_loss": 0.0,  # 当前项目没有，设为0.0
+            "mean_density": 0.0,  # 当前项目没有，设为0.0
+        }
+        
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writerow(row)
+    except Exception:
+        # 日志失败不应影响主流程，静默忽略
+        pass
+
+
+# ==================== Runtime Statistics Functions ====================
+
+def _save_runtime_stats(output_dir, tracking_iter_time_avg, tracking_frame_time_avg,
+                       mapping_iter_time_avg, mapping_frame_time_avg, final_frame):
+    """
+    Save runtime statistics to both TXT and JSON files.
+    """
+    stats = {
+        "tracking_iteration_time_ms": tracking_iter_time_avg * 1000,
+        "tracking_frame_time_s": tracking_frame_time_avg,
+        "mapping_iteration_time_ms": mapping_iter_time_avg * 1000,
+        "mapping_frame_time_s": mapping_frame_time_avg,
+        "final_frame": final_frame,
+    }
+    
+    # Save as JSON
+    json_path = os.path.join(output_dir, "runtime_stats.json")
+    try:
+        with open(json_path, "w") as f:
+            json.dump(stats, f, indent=2)
+    except Exception:
+        pass
+    
+    # Save as TXT
+    txt_path = os.path.join(output_dir, "runtime_stats.txt")
+    try:
+        with open(txt_path, "w") as f:
+            f.write("Runtime Statistics\n")
+            f.write("=" * 50 + "\n\n")
+            f.write(f"Average Tracking/Iteration Time: {stats['tracking_iteration_time_ms']:.2f} ms\n")
+            f.write(f"Average Tracking/Frame Time: {stats['tracking_frame_time_s']:.4f} s\n")
+            f.write(f"Average Mapping/Iteration Time: {stats['mapping_iteration_time_ms']:.2f} ms\n")
+            f.write(f"Average Mapping/Frame Time: {stats['mapping_frame_time_s']:.4f} s\n")
+            f.write(f"Final Frame: {stats['final_frame']}\n")
+    except Exception:
+        pass
 
 
 def get_dataset(config_dict, basedir, sequence, **kwargs):
@@ -452,7 +588,47 @@ def convert_params_to_store(params):
     return params_to_store
 
 
-def rgbd_slam(config: dict):
+def add_camera_params_to_checkpoint(params, variables, intrinsics, first_frame_w2c, 
+                                    dataset_config, gt_w2c_all_frames, keyframe_time_indices):
+    """
+    添加相机参数到检查点参数字典中，使检查点文件可用于可视化。
+    
+    Args:
+        params: 高斯参数字典
+        variables: 变量字典（包含 timestep）
+        intrinsics: 相机内参
+        first_frame_w2c: 第一帧的 world-to-camera 变换
+        dataset_config: 数据集配置
+        gt_w2c_all_frames: 到当前帧为止的所有GT位姿列表
+        keyframe_time_indices: 关键帧索引列表
+    
+    Returns:
+        添加了相机参数的参数字典
+    """
+    params_with_camera = convert_params_to_store(params)
+    
+    # 添加 timestep
+    params_with_camera['timestep'] = variables['timestep'].detach().cpu().numpy()
+    
+    # 添加相机参数
+    params_with_camera['intrinsics'] = intrinsics.detach().cpu().numpy()
+    params_with_camera['w2c'] = first_frame_w2c.detach().cpu().numpy()
+    params_with_camera['org_width'] = dataset_config["desired_image_width"]
+    params_with_camera['org_height'] = dataset_config["desired_image_height"]
+    
+    # 保存到当前帧为止的所有GT位姿
+    params_with_camera['gt_w2c_all_frames'] = []
+    for gt_w2c_tensor in gt_w2c_all_frames:
+        params_with_camera['gt_w2c_all_frames'].append(gt_w2c_tensor.detach().cpu().numpy())
+    params_with_camera['gt_w2c_all_frames'] = np.stack(params_with_camera['gt_w2c_all_frames'], axis=0)
+    
+    # 添加关键帧索引
+    params_with_camera['keyframe_time_indices'] = np.array(keyframe_time_indices)
+    
+    return params_with_camera
+
+
+def rgbd_slam(config: dict, end_at: int = None):
     # Print Config
     print("Loaded Config:")
     if "use_depth_loss_thres" not in config['tracking']:
@@ -463,6 +639,35 @@ def rgbd_slam(config: dict):
     if "gaussian_distribution" not in config:
         config['gaussian_distribution'] = "isotropic"
     print(f"{config}")
+    
+    # Check for existing checkpoints if end_at is specified
+    if end_at is not None:
+        output_dir = os.path.join(config["workdir"], config["run_name"])
+        
+        # Find the highest checkpoint that exists
+        max_checkpoint = -1
+        if os.path.exists(output_dir):
+            for filename in os.listdir(output_dir):
+                if filename.startswith("params") and filename.endswith(".npz"):
+                    try:
+                        checkpoint_num = int(filename[6:-4])  # Extract number from "params{num}.npz"
+                        if checkpoint_num > max_checkpoint:
+                            max_checkpoint = checkpoint_num
+                    except ValueError:
+                        continue
+        
+        # Check if we've already finished (if there's a checkpoint >= end_at)
+        if max_checkpoint >= end_at:
+            print(f"Already finished at frame {max_checkpoint} (target: {end_at}). Skipping.")
+            return
+        
+        # If we have a checkpoint but haven't finished, auto-load from it
+        if max_checkpoint >= 0 and max_checkpoint < end_at:
+            print(f"Found checkpoint at frame {max_checkpoint}, will continue from there to {end_at}")
+            if not config.get('load_checkpoint', False):
+                config['load_checkpoint'] = True
+                config['checkpoint_time_idx'] = max_checkpoint
+                print(f"Auto-enabled checkpoint loading from frame {max_checkpoint}")
 
     # Create Output Directories
     output_dir = os.path.join(config["workdir"], config["run_name"])
@@ -486,6 +691,8 @@ def rgbd_slam(config: dict):
     # Load Dataset
     print("Loading Dataset ...")
     dataset_config = config["data"]
+    print(f"Dataset: {dataset_config.get('sequence', 'unknown')}")
+    print(f"Basedir: {dataset_config.get('basedir', 'unknown')}")
     if "gradslam_data_cfg" not in dataset_config:
         gradslam_data_cfg = {}
         gradslam_data_cfg["dataset_name"] = dataset_config["dataset_name"]
@@ -533,6 +740,8 @@ def rgbd_slam(config: dict):
     num_frames = dataset_config["num_frames"]
     if num_frames == -1:
         num_frames = len(dataset)
+    print(f"Total Frames: {num_frames}")
+    print(f"Dataset Loaded Successfully.")
 
     # Init seperate dataloader for densification if required
     if seperate_densification_res:
@@ -601,20 +810,82 @@ def rgbd_slam(config: dict):
     mapping_frame_time_sum = 0
     mapping_frame_time_count = 0
 
+    # Initialize metrics CSV logging
+    metrics_csv_path = os.path.join(output_dir, "metrics_log.csv")
+    checkpoint_time_idx = None
+    if config['load_checkpoint']:
+        checkpoint_time_idx = config.get('checkpoint_time_idx', 0)
+        
+        # 如果 checkpoint_time_idx 为 -1，自动选择最新的
+        if checkpoint_time_idx == -1:
+            max_checkpoint = -1
+            if os.path.exists(output_dir):
+                for filename in os.listdir(output_dir):
+                    if filename.startswith("params") and filename.endswith(".npz"):
+                        # 排除 params.npz（最终文件）
+                        if filename == "params.npz":
+                            continue
+                        try:
+                            checkpoint_num = int(filename[6:-4])  # Extract number from "params{num}.npz"
+                            if checkpoint_num > max_checkpoint:
+                                max_checkpoint = checkpoint_num
+                        except ValueError:
+                            continue
+            
+            if max_checkpoint >= 0:
+                checkpoint_time_idx = max_checkpoint
+                print(f"[Checkpoint] Auto-selected latest checkpoint: frame {checkpoint_time_idx}")
+            else:
+                print("[Checkpoint] No existing checkpoints found, starting from frame 0.")
+                config['load_checkpoint'] = False
+                checkpoint_time_idx = 0
+        else:
+            print(f"[Checkpoint] Using specified checkpoint: frame {checkpoint_time_idx}")
+    
+    # Initialize metrics CSV (will truncate if checkpoint exists)
+    metrics_fieldnames = _init_metrics_csv(metrics_csv_path, checkpoint_time_idx)
+    
     # Load Checkpoint
     if config['load_checkpoint']:
-        checkpoint_time_idx = config['checkpoint_time_idx']
-        print(f"Loading Checkpoint for Frame {checkpoint_time_idx}")
         ckpt_path = os.path.join(config['workdir'], config['run_name'], f"params{checkpoint_time_idx}.npz")
-        params = dict(np.load(ckpt_path, allow_pickle=True))
-        params = {k: torch.tensor(params[k]).cuda().float().requires_grad_(True) for k in params.keys()}
-        variables['max_2D_radius'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
-        variables['means2D_gradient_accum'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
-        variables['denom'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
-        variables['timestep'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
-        # Load the keyframe time idx list
-        keyframe_time_indices = np.load(os.path.join(config['workdir'], config['run_name'], f"keyframe_time_indices{checkpoint_time_idx}.npy"))
-        keyframe_time_indices = keyframe_time_indices.tolist()
+        keyframe_path = os.path.join(config['workdir'], config['run_name'], f"keyframe_time_indices{checkpoint_time_idx}.npy")
+        
+        if not os.path.exists(ckpt_path):
+            print(f"[Checkpoint Warning] Checkpoint file not found: {ckpt_path}")
+            print("[Checkpoint] Starting from frame 0 instead.")
+            config['load_checkpoint'] = False
+            checkpoint_time_idx = 0
+        else:
+            print(f"[Checkpoint] Loading checkpoint from: {ckpt_path}")
+            params = dict(np.load(ckpt_path, allow_pickle=True))
+            
+            # Extract timestep and other non-trainable parameters from params
+            # timestep should go to variables, not params
+            if 'timestep' in params:
+                variables['timestep'] = torch.tensor(params['timestep']).cuda().float()
+                params.pop('timestep')
+            else:
+                # If no timestep in checkpoint, initialize it
+                variables['timestep'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
+            
+            # Remove other non-trainable parameters that shouldn't be in params
+            for k in ['intrinsics', 'w2c', 'org_width', 'org_height', 'gt_w2c_all_frames', 'keyframe_time_indices']:
+                if k in params:
+                    params.pop(k)
+            
+            # Convert remaining params to trainable tensors
+            params = {k: torch.tensor(params[k]).cuda().float().requires_grad_(True) for k in params.keys()}
+            
+            variables['max_2D_radius'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
+            variables['means2D_gradient_accum'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
+            variables['denom'] = torch.zeros(params['means3D'].shape[0]).cuda().float()
+            # Load the keyframe time idx list
+            if os.path.exists(keyframe_path):
+                keyframe_time_indices = np.load(keyframe_path).tolist()
+                print(f"[Checkpoint] Loaded {len(keyframe_time_indices)} keyframes")
+            else:
+                print(f"[Checkpoint Warning] Keyframe index file not found: {keyframe_path}")
+                keyframe_time_indices = []
         # Update the ground truth poses list
         for time_idx in range(checkpoint_time_idx):
             # Load RGBD frames incrementally instead of all frames
@@ -638,6 +909,10 @@ def rgbd_slam(config: dict):
                 keyframe_list.append(curr_keyframe)
     else:
         checkpoint_time_idx = 0
+    
+    # Adjust num_frames if end_at is specified
+    if end_at is not None:
+        num_frames = min(num_frames, end_at + 1) if num_frames > 0 else end_at + 1
     
     # Iterate over Scan
     for time_idx in tqdm(range(checkpoint_time_idx, num_frames)):
@@ -695,6 +970,17 @@ def rgbd_slam(config: dict):
                                                    config['tracking']['use_l1'], config['tracking']['ignore_outlier_depth_loss'], tracking=True, 
                                                    plot_dir=eval_dir, visualize_tracking_loss=config['tracking']['visualize_tracking_loss'],
                                                    tracking_iteration=iter)
+                
+                # Record metrics to CSV (before backward)
+                _append_metrics_row(
+                    metrics_csv_path,
+                    metrics_fieldnames,
+                    frame_idx=time_idx,
+                    stage="tracking",
+                    step_idx=iter,
+                    losses=losses
+                )
+                
                 if config['use_wandb']:
                     # Report Loss
                     wandb_tracking_step = report_loss(losses, wandb_run, wandb_tracking_step, tracking=True)
@@ -770,7 +1056,12 @@ def rgbd_slam(config: dict):
                 progress_bar.close()
             except:
                 ckpt_output_dir = os.path.join(config["workdir"], config["run_name"])
-                save_params_ckpt(params, ckpt_output_dir, time_idx)
+                # 添加相机参数到检查点
+                params_with_camera = add_camera_params_to_checkpoint(
+                    params, variables, intrinsics, first_frame_w2c,
+                    dataset_config, gt_w2c_all_frames, keyframe_time_indices
+                )
+                save_params_ckpt(params_with_camera, ckpt_output_dir, time_idx)
                 print('Failed to evaluate trajectory.')
 
         # Densification & KeyFrame-based Mapping
@@ -847,6 +1138,17 @@ def rgbd_slam(config: dict):
                 loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
                                                 config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
                                                 config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'], mapping=True)
+                
+                # Record metrics to CSV (before backward)
+                _append_metrics_row(
+                    metrics_csv_path,
+                    metrics_fieldnames,
+                    frame_idx=time_idx,
+                    stage="mapping",
+                    step_idx=iter,
+                    losses=losses
+                )
+                
                 if config['use_wandb']:
                     # Report Loss
                     wandb_mapping_step = report_loss(losses, wandb_run, wandb_mapping_step, mapping=True)
@@ -905,7 +1207,12 @@ def rgbd_slam(config: dict):
                     progress_bar.close()
                 except:
                     ckpt_output_dir = os.path.join(config["workdir"], config["run_name"])
-                    save_params_ckpt(params, ckpt_output_dir, time_idx)
+                    # 添加相机参数到检查点
+                    params_with_camera = add_camera_params_to_checkpoint(
+                        params, variables, intrinsics, first_frame_w2c,
+                        dataset_config, gt_w2c_all_frames, keyframe_time_indices
+                    )
+                    save_params_ckpt(params_with_camera, ckpt_output_dir, time_idx)
                     print('Failed to evaluate trajectory.')
         
         # Add frame to keyframe list
@@ -927,14 +1234,59 @@ def rgbd_slam(config: dict):
         # Checkpoint every iteration
         if time_idx % config["checkpoint_interval"] == 0 and config['save_checkpoints']:
             ckpt_output_dir = os.path.join(config["workdir"], config["run_name"])
-            save_params_ckpt(params, ckpt_output_dir, time_idx)
+            # 添加相机参数到检查点
+            params_with_camera = add_camera_params_to_checkpoint(
+                params, variables, intrinsics, first_frame_w2c,
+                dataset_config, gt_w2c_all_frames, keyframe_time_indices
+            )
+            save_params_ckpt(params_with_camera, ckpt_output_dir, time_idx)
             np.save(os.path.join(ckpt_output_dir, f"keyframe_time_indices{time_idx}.npy"), np.array(keyframe_time_indices))
+            print(f"[Checkpoint] Saved checkpoint at frame {time_idx}")
+            
+            # 清理旧 checkpoint（保留最近 N 个）
+            max_keep = config.get('max_checkpoints_to_keep', 3)
+            if max_keep > 0:
+                try:
+                    checkpoint_files = []
+                    for filename in os.listdir(ckpt_output_dir):
+                        if filename.startswith("params") and filename.endswith(".npz") and filename != "params.npz":
+                            try:
+                                checkpoint_num = int(filename[6:-4])  # Extract number from "params{num}.npz"
+                                checkpoint_files.append((checkpoint_num, filename))
+                            except ValueError:
+                                continue
+                    
+                    if len(checkpoint_files) > max_keep:
+                        checkpoint_files.sort(key=lambda x: x[0])
+                        num_to_delete = len(checkpoint_files) - max_keep
+                        deleted_count = 0
+                        for i in range(num_to_delete):
+                            frame_num, params_file = checkpoint_files[i]
+                            params_path = os.path.join(ckpt_output_dir, params_file)
+                            keyframe_path = os.path.join(ckpt_output_dir, f"keyframe_time_indices{frame_num}.npy")
+                            if os.path.exists(params_path):
+                                os.remove(params_path)
+                                deleted_count += 1
+                            if os.path.exists(keyframe_path):
+                                os.remove(keyframe_path)
+                        if deleted_count > 0:
+                            print(f"[Checkpoint] Cleaned up {deleted_count} old checkpoint(s), keeping latest {max_keep}")
+                except Exception as e:
+                    print(f"[Checkpoint Cleanup Warning] Failed to clean old checkpoints: {e}")
         
         # Increment WandB Time Step
         if config['use_wandb']:
             wandb_time_step += 1
 
         torch.cuda.empty_cache()
+        
+        # Check if we should stop at end_at
+        if end_at is not None and time_idx >= end_at:
+            # Find the actual checkpoint that was saved (may be less than end_at due to checkpoint_interval)
+            checkpoint_interval = config.get("checkpoint_interval", 100)
+            actual_checkpoint = (end_at // checkpoint_interval) * checkpoint_interval
+            print(f"finish at {actual_checkpoint}")
+            break
 
     # Compute Average Runtimes
     if tracking_iter_time_count == 0:
@@ -947,10 +1299,27 @@ def rgbd_slam(config: dict):
     tracking_frame_time_avg = tracking_frame_time_sum / tracking_frame_time_count
     mapping_iter_time_avg = mapping_iter_time_sum / mapping_iter_time_count
     mapping_frame_time_avg = mapping_frame_time_sum / mapping_frame_time_count
-    print(f"\nAverage Tracking/Iteration Time: {tracking_iter_time_avg*1000} ms")
-    print(f"Average Tracking/Frame Time: {tracking_frame_time_avg} s")
-    print(f"Average Mapping/Iteration Time: {mapping_iter_time_avg*1000} ms")
-    print(f"Average Mapping/Frame Time: {mapping_frame_time_avg} s")
+    
+    # Print runtime statistics
+    print(f"\nAverage Tracking/Iteration Time: {tracking_iter_time_avg*1000:.2f} ms")
+    print(f"Average Tracking/Frame Time: {tracking_frame_time_avg:.4f} s")
+    print(f"Average Mapping/Iteration Time: {mapping_iter_time_avg*1000:.2f} ms")
+    print(f"Average Mapping/Frame Time: {mapping_frame_time_avg:.4f} s")
+    
+    # Determine final frame (time_idx is the last processed frame)
+    final_frame = time_idx if 'time_idx' in locals() and time_idx >= 0 else (num_frames - 1)
+    print(f"Final Frame: {final_frame}")
+    
+    # Save runtime statistics
+    _save_runtime_stats(
+        output_dir,
+        tracking_iter_time_avg,
+        tracking_frame_time_avg,
+        mapping_iter_time_avg,
+        mapping_frame_time_avg,
+        final_frame
+    )
+    
     if config['use_wandb']:
         wandb_run.log({"Final Stats/Average Tracking Iteration Time (ms)": tracking_iter_time_avg*1000,
                        "Final Stats/Average Tracking Frame Time (s)": tracking_frame_time_avg,
@@ -970,20 +1339,18 @@ def rgbd_slam(config: dict):
                  mapping_iters=config['mapping']['num_iters'], add_new_gaussians=config['mapping']['add_new_gaussians'],
                  eval_every=config['eval_every'])
 
-    # Add Camera Parameters to Save them
-    params['timestep'] = variables['timestep']
-    params['intrinsics'] = intrinsics.detach().cpu().numpy()
-    params['w2c'] = first_frame_w2c.detach().cpu().numpy()
-    params['org_width'] = dataset_config["desired_image_width"]
-    params['org_height'] = dataset_config["desired_image_height"]
-    params['gt_w2c_all_frames'] = []
-    for gt_w2c_tensor in gt_w2c_all_frames:
-        params['gt_w2c_all_frames'].append(gt_w2c_tensor.detach().cpu().numpy())
-    params['gt_w2c_all_frames'] = np.stack(params['gt_w2c_all_frames'], axis=0)
-    params['keyframe_time_indices'] = np.array(keyframe_time_indices)
-    
-    # Save Parameters
-    save_params(params, output_dir)
+    # 检查最后一帧是否是检查点，如果不是，保存最终检查点
+    checkpoint_interval = config.get("checkpoint_interval", 100)
+    if config['save_checkpoints'] and final_frame % checkpoint_interval != 0:
+        # 最后一帧不是检查点，保存最终检查点
+        print(f"[Final Checkpoint] Saving final checkpoint at frame {final_frame}")
+        params_with_camera = add_camera_params_to_checkpoint(
+            params, variables, intrinsics, first_frame_w2c,
+            dataset_config, gt_w2c_all_frames, keyframe_time_indices
+        )
+        save_params_ckpt(params_with_camera, output_dir, final_frame)
+        np.save(os.path.join(output_dir, f"keyframe_time_indices{final_frame}.npy"), np.array(keyframe_time_indices))
+        print(f"[Final Checkpoint] Saved final checkpoint at frame {final_frame}")
 
     # Close WandB Run
     if config['use_wandb']:
@@ -993,6 +1360,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument("experiment", type=str, help="Path to experiment file")
+    parser.add_argument("--end-at", type=int, default=None, help="Stop at this frame number")
 
     args = parser.parse_args()
 
@@ -1011,4 +1379,4 @@ if __name__ == "__main__":
         os.makedirs(results_dir, exist_ok=True)
         shutil.copy(args.experiment, os.path.join(results_dir, "config.py"))
 
-    rgbd_slam(experiment.config)
+    rgbd_slam(experiment.config, end_at=args.end_at)

@@ -3,17 +3,22 @@ from os.path import join as p_join
 
 scenes = ["room0", "room1", "room2",
           "office0", "office1", "office2",
-          "office_", "office4"]
+          "office3", "office4"]
 
 primary_device="cuda:0"
 seed = 0
-scene_name = scenes[0]
 
-map_every = 1
+# 支持通过环境变量 SPLATAM_SCENE_INDEX 选择场景（用于批量脚本）
+scene_index = int(os.environ.get("SPLATAM_SCENE_INDEX", "0"))
+if scene_index < 0 or scene_index >= len(scenes):
+    scene_index = 0
+scene_name = scenes[scene_index]
+
+map_every = 5
 keyframe_every = 5
 mapping_window_size = 24
-tracking_iters = 40
-mapping_iters = 60
+tracking_iters = 10
+mapping_iters = 40
 
 group_name = "Replica"
 run_name = f"{scene_name}_{seed}"
@@ -34,9 +39,9 @@ config = dict(
     report_iter_progress=False,
     load_checkpoint=False,
     checkpoint_time_idx=0,
-    save_checkpoints=False, # Save Checkpoints
+    save_checkpoints=True, # Save Checkpoints
     checkpoint_interval=100, # Checkpoint Interval
-    use_wandb=True,
+    use_wandb=False,  # 是否使用WandB（默认False）
     wandb=dict(
         entity="theairlab",
         project="SplaTAM",
